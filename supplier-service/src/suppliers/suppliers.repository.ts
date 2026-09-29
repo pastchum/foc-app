@@ -36,28 +36,34 @@ const jsonParam = (value: unknown): string | null =>
  * All SQL for the suppliers tables. Every function takes a {@link Queryable} so
  * the service can run several of them in one transaction.
  */
+// The supplier insert, shared by the plain and insert-if-absent variants so the
+// column list, placeholders and params stay in lockstep — add a column once.
+const INSERT_COLUMNS =
+  'supplier_id, name, type, building, floor, location_description, opening_hours, latitude, longitude, image_url, tags';
+const INSERT_VALUES = '$1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11::jsonb';
+
+const insertParams = (s: NewSupplier): unknown[] => [
+  s.supplierId,
+  s.name,
+  s.type,
+  s.building,
+  s.floor,
+  s.locationDescription,
+  jsonParam(s.openingHours ?? null),
+  s.latitude ?? null,
+  s.longitude ?? null,
+  s.imageUrl ?? null,
+  jsonParam(s.tags ?? null),
+];
+
 export const suppliersRepository = {
   /** Inserts a supplier. Throws the unique violation on an active name+building clash. */
   async insert(q: Queryable, s: NewSupplier): Promise<SupplierRow> {
     const { rows } = await q.query<SupplierRow>(
-      `INSERT INTO suppliers
-         (supplier_id, name, type, building, floor, location_description,
-          opening_hours, latitude, longitude, image_url, tags)
-       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11::jsonb)
+      `INSERT INTO suppliers (${INSERT_COLUMNS})
+       VALUES (${INSERT_VALUES})
        RETURNING *`,
-      [
-        s.supplierId,
-        s.name,
-        s.type,
-        s.building,
-        s.floor,
-        s.locationDescription,
-        jsonParam(s.openingHours ?? null),
-        s.latitude ?? null,
-        s.longitude ?? null,
-        s.imageUrl ?? null,
-        jsonParam(s.tags ?? null),
-      ],
+      insertParams(s),
     );
     return rows[0]!;
   },
@@ -65,25 +71,11 @@ export const suppliersRepository = {
   /** Insert-if-absent, keyed on the stable primary key. Returns the row only when it was created. */
   async insertIfAbsent(q: Queryable, s: NewSupplier): Promise<SupplierRow | null> {
     const { rows } = await q.query<SupplierRow>(
-      `INSERT INTO suppliers
-         (supplier_id, name, type, building, floor, location_description,
-          opening_hours, latitude, longitude, image_url, tags)
-       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11::jsonb)
+      `INSERT INTO suppliers (${INSERT_COLUMNS})
+       VALUES (${INSERT_VALUES})
        ON CONFLICT (supplier_id) DO NOTHING
        RETURNING *`,
-      [
-        s.supplierId,
-        s.name,
-        s.type,
-        s.building,
-        s.floor,
-        s.locationDescription,
-        jsonParam(s.openingHours ?? null),
-        s.latitude ?? null,
-        s.longitude ?? null,
-        s.imageUrl ?? null,
-        jsonParam(s.tags ?? null),
-      ],
+      insertParams(s),
     );
     return rows[0] ?? null;
   },
