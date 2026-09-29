@@ -1,7 +1,7 @@
 import 'reflect-metadata';
 import { NestFactory } from '@nestjs/core';
-import { createLogger, PinoLoggerService, runMigrations, startService } from '@foc/platform';
-import { DB, type Db } from './db/db.js';
+import { createLogger, PgDb, PinoLoggerService, runMigrations, startService } from '@foc/platform';
+import { DB, type Database } from './db/db.js';
 import { migrations } from './db/migrations.js';
 import { loadSeedSuppliers } from './admin/seed-data.js';
 import { seedSuppliers } from './admin/seed.js';
@@ -15,13 +15,18 @@ async function main(): Promise<void> {
   const logger = new PinoLoggerService(createLogger(SERVICE_NAME, env.LOG_LEVEL));
   const app = await NestFactory.create(AppModule, { logger });
 
-  // Schema first, then traffic: a request must never reach a database that is behind.
-  const applied = await runMigrations(app.get<Db>(DB), migrations);
+  // Schema first, then traffic: a request must never reach a database that is
+  // behind. Migrations are multi-statement DDL, which needs the raw `pg` port
+  // (Drizzle's query path runs one statement per call); the pool is closed once
+  // they are applied. Application queries go through the Drizzle DB provider.
+  const migrator = new PgDb(env.DATABASE_URL);
+  const applied = await runMigrations(migrator, migrations);
+  await migrator.close();
   if (applied.length > 0) logger.log(`Applied migrations: ${applied.join(', ')}`);
 
   // Idempotent: safe to run on every boot, never overwrites an admin's edits.
   const suppliers = await loadSeedSuppliers();
-  const seeded = await seedSuppliers(app.get<Db>(DB), suppliers);
+  const seeded = await seedSuppliers(app.get<Database>(DB), suppliers);
   logger.log(
     `Supplier seed: ${seeded.created.length} created, ${seeded.skipped.length} already present.`,
   );

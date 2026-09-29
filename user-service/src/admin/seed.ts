@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { hashPassword } from '../auth/passwords.js';
-import type { Db } from '../db/db.js';
+import type { Database } from '../db/db.js';
 import { isAllowedDomain, normalizeEmail } from '../users/email.js';
 import { usersRepository } from '../users/users.repository.js';
 import { adminRepository } from './admin.repository.js';
@@ -20,7 +20,7 @@ export interface SeedResult {
  * bootstrap secret and is never logged.
  */
 export async function seedAdmins(
-  db: Db,
+  db: Database,
   config: { emails?: string[]; password?: string; allowedDomains: readonly string[] },
 ): Promise<SeedResult> {
   const result: SeedResult = { created: [], skipped: [] };

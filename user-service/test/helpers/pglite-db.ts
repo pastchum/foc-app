@@ -1,29 +1,32 @@
 import { PGlite } from '@electric-sql/pglite';
-import type { Db, Queryable, Row } from '../../src/db/db.js';
+import type { Db, Queryable, Row } from '@foc/platform';
 
 /**
- * Runs the service's real SQL on PGlite (PostgreSQL compiled to WASM), so the
- * suite exercises actual constraints, unique indexes and transactions without
- * needing a database server or Docker.
+ * The raw {@link Db} port over PGlite (PostgreSQL compiled to WASM), so the
+ * suite exercises actual constraints, unique indexes and transactions without a
+ * database server or Docker. Used for two things: running the real migrations
+ * (multi-statement DDL) and letting tests assert on stored rows directly. The
+ * service's own queries run through a Drizzle instance built over the same
+ * {@link client} — see the test app helper.
  */
 export class PgliteDb implements Db {
-  private constructor(private readonly pg: PGlite) {}
+  private constructor(readonly client: PGlite) {}
 
   static async create(): Promise<PgliteDb> {
     return new PgliteDb(await PGlite.create());
   }
 
   async query<T extends Row = Row>(sql: string, params?: unknown[]): Promise<{ rows: T[] }> {
-    const res = await this.pg.query<T>(sql, params);
+    const res = await this.client.query<T>(sql, params);
     return { rows: res.rows };
   }
 
   async exec(sql: string): Promise<void> {
-    await this.pg.exec(sql);
+    await this.client.exec(sql);
   }
 
   async transaction<T>(fn: (tx: Queryable) => Promise<T>): Promise<T> {
-    return this.pg.transaction(async (t) =>
+    return this.client.transaction(async (t) =>
       fn({
         query: async <R extends Row = Row>(sql: string, params?: unknown[]) => {
           const res = await t.query<R>(sql, params);
@@ -37,6 +40,6 @@ export class PgliteDb implements Db {
   }
 
   async close(): Promise<void> {
-    await this.pg.close();
+    await this.client.close();
   }
 }

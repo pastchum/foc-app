@@ -2,7 +2,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import { ApiException } from '@foc/platform';
 import { sessionsRepository as sessions } from '../auth/sessions.repository.js';
-import { DB, type Db, type Queryable } from '../db/db.js';
+import { DB, type Database } from '../db/db.js';
 import {
   usersRepository as users,
   type AccountStatus,
@@ -32,26 +32,26 @@ export const toAdminUserView = (r: AdminUserRow): AdminUserView => ({
   email: r.email,
   roles: r.roles,
   status: r.status,
-  isSeededAdmin: r.is_seeded_admin,
+  isSeededAdmin: r.isSeededAdmin,
   profile: {
-    displayName: r.display_name,
+    displayName: r.displayName,
     faculty: r.faculty,
-    avatarRef: r.avatar_ref,
-    contactPreference: r.contact_preference,
-    preferredMode: r.preferred_mode,
+    avatarRef: r.avatarRef,
+    contactPreference: r.contactPreference,
+    preferredMode: r.preferredMode,
   },
-  createdAt: new Date(r.created_at).toISOString(),
-  activatedAt: r.activated_at ? new Date(r.activated_at).toISOString() : null,
+  createdAt: new Date(r.createdAt).toISOString(),
+  activatedAt: r.activatedAt ? new Date(r.activatedAt).toISOString() : null,
 });
 
 const toAuditView = (r: AuditRow) => ({
   id: r.id,
-  actorId: r.actor_id,
-  targetUserId: r.target_user_id,
+  actorId: r.actorId,
+  targetUserId: r.targetUserId,
   action: r.action,
   reason: r.reason,
-  occurredAt: new Date(r.occurred_at).toISOString(),
-  correlationId: r.correlation_id,
+  occurredAt: new Date(r.occurredAt).toISOString(),
+  correlationId: r.correlationId,
 });
 
 const notFound = () => new ApiException(404, 'NOT_FOUND', 'User not found.');
@@ -63,7 +63,7 @@ const notFound = () => new ApiException(404, 'NOT_FOUND', 'User not found.');
  */
 @Injectable()
 export class AdminService {
-  constructor(@Inject(DB) private readonly db: Db) {}
+  constructor(@Inject(DB) private readonly db: Database) {}
 
   async listUsers(f: {
     page: number;
@@ -222,7 +222,7 @@ export class AdminService {
   }
 
   private async record(
-    tx: Queryable,
+    tx: Database,
     actorId: string,
     targetUserId: string,
     action: 'SUSPEND' | 'REACTIVATE' | 'ROLE_GRANT' | 'ROLE_REVOKE',

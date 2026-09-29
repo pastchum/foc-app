@@ -1,14 +1,14 @@
 import { Body, Controller, Get, Inject, Patch, Req, UseGuards } from '@nestjs/common';
 import { ApiException } from '@foc/platform';
 import { AccessTokenGuard, type AuthedRequest } from '../auth/access-token.guard.js';
-import { DB, type Db } from '../db/db.js';
+import { DB, type Database } from '../db/db.js';
 import { usersRepository } from './users.repository.js';
 import { parseOrThrow, profileUpdateSchema } from './validation.js';
 
 @Controller('users/me')
 @UseGuards(AccessTokenGuard)
 export class MeController {
-  constructor(@Inject(DB) private readonly db: Db) {}
+  constructor(@Inject(DB) private readonly db: Database) {}
 
   @Get()
   me(@Req() req: AuthedRequest) {
@@ -37,13 +37,13 @@ export class MeController {
       roles: u.roles,
       status: u.status,
       profile: {
-        displayName: u.display_name,
+        displayName: u.displayName,
         faculty: u.faculty,
-        avatarRef: u.avatar_ref,
-        contactPreference: u.contact_preference,
-        preferredMode: u.preferred_mode,
+        avatarRef: u.avatarRef,
+        contactPreference: u.contactPreference,
+        preferredMode: u.preferredMode,
       },
-      createdAt: new Date(u.created_at).toISOString(),
+      createdAt: new Date(u.createdAt).toISOString(),
     };
   }
 }

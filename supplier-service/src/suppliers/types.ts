@@ -1,3 +1,5 @@
+import type { suppliers } from '../db/schema.js';
+
 /** The closed set of supplier categories (SUP-01). Enforced by the DB and the validator. */
 export const SUPPLIER_TYPES = ['FOOD', 'CAFE', 'PRINTING', 'SHOPPING', 'LANDMARK'] as const;
 export type SupplierType = (typeof SUPPLIER_TYPES)[number];
@@ -32,27 +34,13 @@ export interface SupplierInput {
 }
 
 /**
- * A row as stored. `latitude`/`longitude` come back as strings from `pg`'s
- * numeric mapping. A `type` alias, not an `interface`, so it satisfies the
- * repository's `Row` (`Record<string, unknown>`) query constraint.
+ * A row as stored, inferred straight from the Drizzle schema so the column set
+ * and its types stay in lockstep with the table definition. Keys are camelCase
+ * (Drizzle's field names); `latitude`/`longitude` come back as numbers and the
+ * timestamps as `Date`s. Imported type-only, so the types ⇄ schema reference
+ * cycle is erased at compile time.
  */
-export type SupplierRow = {
-  supplier_id: string;
-  name: string;
-  type: SupplierType;
-  building: string;
-  floor: string;
-  location_description: string;
-  opening_hours: OpeningHours[] | null;
-  latitude: number | string | null;
-  longitude: number | string | null;
-  image_url: string | null;
-  tags: string[] | null;
-  active: boolean;
-  version: number;
-  created_at: string | Date;
-  updated_at: string | Date;
-};
+export type SupplierRow = typeof suppliers.$inferSelect;
 
 /** The public JSON shape returned by the API — camelCase, coordinates as numbers. */
 export interface SupplierView {
@@ -73,23 +61,26 @@ export interface SupplierView {
   updatedAt: string;
 }
 
+// Coordinates are `double precision`, which both `pg` and PGlite return as JS
+// numbers; the `string` case is belt-and-braces for any driver that maps them
+// as text.
 const num = (v: number | string | null): number | null =>
   v === null ? null : typeof v === 'number' ? v : Number(v);
 
 export const toSupplierView = (r: SupplierRow): SupplierView => ({
-  supplierId: r.supplier_id,
+  supplierId: r.supplierId,
   name: r.name,
   type: r.type,
   building: r.building,
   floor: r.floor,
-  locationDescription: r.location_description,
-  openingHours: r.opening_hours,
+  locationDescription: r.locationDescription,
+  openingHours: r.openingHours,
   latitude: num(r.latitude),
   longitude: num(r.longitude),
-  imageUrl: r.image_url,
+  imageUrl: r.imageUrl,
   tags: r.tags,
   active: r.active,
   version: r.version,
-  createdAt: new Date(r.created_at).toISOString(),
-  updatedAt: new Date(r.updated_at).toISOString(),
+  createdAt: new Date(r.createdAt).toISOString(),
+  updatedAt: new Date(r.updatedAt).toISOString(),
 });

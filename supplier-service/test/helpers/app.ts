@@ -1,9 +1,11 @@
 import type { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
+import { drizzle } from 'drizzle-orm/pglite';
 import request from 'supertest';
 import { AUTHENTICATOR, AuthModule, authFailure, type AuthContext } from '@foc/auth-client';
-import { ErrorEnvelopeFilter, PlatformModule, runMigrations } from '@foc/platform';
-import { DB, type Db } from '../../src/db/db.js';
+import { ErrorEnvelopeFilter, PlatformModule, runMigrations, type Db } from '@foc/platform';
+import { DB } from '../../src/db/db.js';
+import * as schema from '../../src/db/schema.js';
 import { migrations } from '../../src/db/migrations.js';
 import { SuppliersModule } from '../../src/suppliers/suppliers.module.js';
 import { PgliteDb } from './pglite-db.js';
@@ -46,8 +48,11 @@ export interface TestApp {
 
 /** Boots the real Supplier modules against a fresh in-memory PostgreSQL with migrations applied. */
 export async function createTestApp(): Promise<TestApp> {
+  // Raw port: runs the migrations and backs `t.db` for direct row assertions.
   const db = await PgliteDb.create();
   await runMigrations(db, migrations);
+  // What the service actually queries through — Drizzle over the same PGlite.
+  const drizzleDb = drizzle(db.client, { schema });
 
   const moduleRef = await Test.createTestingModule({
     imports: [
@@ -64,7 +69,7 @@ export async function createTestApp(): Promise<TestApp> {
     ],
   })
     .overrideProvider(DB)
-    .useValue(db)
+    .useValue(drizzleDb)
     .overrideProvider(AUTHENTICATOR)
     .useValue(fakeAuthenticator)
     .compile();

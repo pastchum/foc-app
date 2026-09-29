@@ -1,7 +1,7 @@
 import 'reflect-metadata';
 import { NestFactory } from '@nestjs/core';
-import { createLogger, PinoLoggerService, runMigrations, startService } from '@foc/platform';
-import { DB, type Db } from './db/db.js';
+import { createLogger, PgDb, PinoLoggerService, runMigrations, startService } from '@foc/platform';
+import { DB, type Database } from './db/db.js';
 import { migrations } from './db/migrations.js';
 import { seedAdmins } from './admin/seed.js';
 
@@ -14,11 +14,16 @@ async function main(): Promise<void> {
   const logger = new PinoLoggerService(createLogger(SERVICE_NAME, env.LOG_LEVEL));
   const app = await NestFactory.create(AppModule, { logger });
 
-  // Schema first, then traffic: a request must never reach a database that is behind.
-  const applied = await runMigrations(app.get<Db>(DB), migrations);
+  // Schema first, then traffic: a request must never reach a database that is
+  // behind. Migrations are multi-statement DDL, which needs the raw `pg` port
+  // (Drizzle's query path runs one statement per call); the pool is closed once
+  // they are applied. Application queries go through the Drizzle DB provider.
+  const migrator = new PgDb(env.DATABASE_URL);
+  const applied = await runMigrations(migrator, migrations);
+  await migrator.close();
   if (applied.length > 0) logger.log(`Applied migrations: ${applied.join(', ')}`);
 
-  const seeded = await seedAdmins(app.get<Db>(DB), {
+  const seeded = await seedAdmins(app.get<Database>(DB), {
     emails: env.ADMIN_SEED_EMAILS,
     password: env.ADMIN_SEED_PASSWORD,
     allowedDomains: env.ALLOWED_EMAIL_DOMAINS,

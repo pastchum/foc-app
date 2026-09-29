@@ -1,9 +1,11 @@
 import type { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
+import { drizzle } from 'drizzle-orm/pglite';
 import type { DestinationStream } from 'pino';
-import { ErrorEnvelopeFilter, PlatformModule, runMigrations } from '@foc/platform';
+import { ErrorEnvelopeFilter, PlatformModule, runMigrations, type Db } from '@foc/platform';
 import { RATE_LIMITERS, RateLimiter, type AuthRateLimiters } from '../../src/auth/rate-limiter.js';
-import { DB, type Db } from '../../src/db/db.js';
+import { DB, type Database } from '../../src/db/db.js';
+import * as schema from '../../src/db/schema.js';
 import { migrations } from '../../src/db/migrations.js';
 import { DevMailbox } from '../../src/mail/dev-mailbox.js';
 import { UsersModule } from '../../src/users/users.module.js';
@@ -13,7 +15,10 @@ export const SERVICE_KEY = 'test-internal-key-0123456789';
 
 export interface TestApp {
   app: INestApplication;
+  /** Raw port over PGlite — for direct SQL assertions and truncation. */
   db: Db;
+  /** The Drizzle handle the service queries through — for tests that drive a repository or seed directly. */
+  orm: Database;
   mailbox: DevMailbox;
   close(): Promise<void>;
 }
@@ -26,8 +31,11 @@ export async function createTestApp(
     rateLimiters?: AuthRateLimiters;
   } = {},
 ): Promise<TestApp> {
+  // Raw port: runs the migrations and backs `t.db` for direct row assertions.
   const db = await PgliteDb.create();
   await runMigrations(db, migrations);
+  // What the service actually queries through — Drizzle over the same PGlite.
+  const drizzleDb = drizzle(db.client, { schema });
 
   const moduleRef = await Test.createTestingModule({
     imports: [
@@ -41,7 +49,7 @@ export async function createTestApp(
     ],
   })
     .overrideProvider(DB)
-    .useValue(db)
+    .useValue(drizzleDb)
     // Generous by default: the suite shares one client IP and registers far more than a person would.
     .overrideProvider(RATE_LIMITERS)
     .useValue(options.rateLimiters ?? openLimiters())
@@ -56,6 +64,7 @@ export async function createTestApp(
   return {
     app,
     db,
+    orm: drizzleDb,
     mailbox: app.get(DevMailbox),
     close: async () => {
       await app.close();

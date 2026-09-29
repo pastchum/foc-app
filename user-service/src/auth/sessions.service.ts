@@ -1,7 +1,7 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import { ApiException } from '@foc/platform';
-import { DB, type Db } from '../db/db.js';
+import { DB, type Database } from '../db/db.js';
 import { normalizeEmail } from '../users/email.js';
 import {
   usersRepository as users,
@@ -37,7 +37,7 @@ export class SessionsService {
   private dummyHash?: Promise<string>;
 
   constructor(
-    @Inject(DB) private readonly db: Db,
+    @Inject(DB) private readonly db: Database,
     @Inject(JWT) private readonly jwt: JwtService,
   ) {}
 

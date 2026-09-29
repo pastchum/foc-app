@@ -40,7 +40,7 @@ export async function activeStudent(t: TestApp, email: string): Promise<Actor> {
 
 /** Creates a seeded administrator through the real seeding path, then logs in. */
 export async function seededAdmin(t: TestApp, email: string): Promise<Actor> {
-  await seedAdmins(t.db, { emails: [email], password: PASSWORD, allowedDomains: ['u.nus.edu'] });
+  await seedAdmins(t.orm, { emails: [email], password: PASSWORD, allowedDomains: ['u.nus.edu'] });
   return login(t, email);
 }
 

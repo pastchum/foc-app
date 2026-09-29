@@ -1,11 +1,21 @@
-import type { Queryable } from '../db/db.js';
+import { and, eq, sql } from 'drizzle-orm';
+import type { PgUpdateSetSource } from 'drizzle-orm/pg-core';
+import type { Database } from '../db/db.js';
+import { suppliers, supplierIdempotencyKeys } from '../db/schema.js';
 import type { SupplierInput, SupplierRow } from './types.js';
 
 /** Postgres error code for a unique-constraint violation, shared by `pg` and PGlite. */
 export const UNIQUE_VIOLATION = '23505';
 
+/**
+ * Drizzle wraps a failed query in a `DrizzleQueryError`, carrying the original
+ * driver error (with its `code` and `constraint`) on `.cause`; older/raw paths
+ * may throw the driver error directly. Check both so a unique violation is
+ * recognised either way.
+ */
 export const isUniqueViolation = (err: unknown, constraint?: string): boolean => {
-  const e = err as { code?: string; constraint?: string } | null;
+  const driver = (err as { cause?: unknown })?.cause ?? err;
+  const e = driver as { code?: string; constraint?: string } | null;
   if (!e || e.code !== UNIQUE_VIOLATION) return false;
   return constraint ? e.constraint === constraint : true;
 };
@@ -15,85 +25,70 @@ export interface NewSupplier extends SupplierInput {
   supplierId: string;
 }
 
-/** Columns an update may set, in the fixed camel→snake map. Values never come from input keys. */
-const UPDATABLE = {
-  name: { column: 'name', json: false },
-  type: { column: 'type', json: false },
-  building: { column: 'building', json: false },
-  floor: { column: 'floor', json: false },
-  locationDescription: { column: 'location_description', json: false },
-  openingHours: { column: 'opening_hours', json: true },
-  latitude: { column: 'latitude', json: false },
-  longitude: { column: 'longitude', json: false },
-  imageUrl: { column: 'image_url', json: false },
-  tags: { column: 'tags', json: true },
-} as const;
+/** Columns an update may set. Keys come from this fixed list, never from input keys. */
+const UPDATABLE_KEYS = [
+  'name',
+  'type',
+  'building',
+  'floor',
+  'locationDescription',
+  'openingHours',
+  'latitude',
+  'longitude',
+  'imageUrl',
+  'tags',
+] as const satisfies readonly (keyof SupplierInput)[];
 
-const jsonParam = (value: unknown): string | null =>
-  value === null || value === undefined ? null : JSON.stringify(value);
+/** Maps a validated input to the row Drizzle inserts (jsonb columns are serialized for us). */
+const insertValues = (s: NewSupplier): typeof suppliers.$inferInsert => ({
+  supplierId: s.supplierId,
+  name: s.name,
+  type: s.type,
+  building: s.building,
+  floor: s.floor,
+  locationDescription: s.locationDescription,
+  openingHours: s.openingHours ?? null,
+  latitude: s.latitude ?? null,
+  longitude: s.longitude ?? null,
+  imageUrl: s.imageUrl ?? null,
+  tags: s.tags ?? null,
+});
 
 /**
- * All SQL for the suppliers tables. Every function takes a {@link Queryable} so
+ * All SQL for the suppliers tables, expressed through Drizzle. Every function
+ * takes a {@link Database} — the top-level instance or a transaction handle — so
  * the service can run several of them in one transaction.
  */
-// The supplier insert, shared by the plain and insert-if-absent variants so the
-// column list, placeholders and params stay in lockstep — add a column once.
-const INSERT_COLUMNS =
-  'supplier_id, name, type, building, floor, location_description, opening_hours, latitude, longitude, image_url, tags';
-const INSERT_VALUES = '$1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11::jsonb';
-
-const insertParams = (s: NewSupplier): unknown[] => [
-  s.supplierId,
-  s.name,
-  s.type,
-  s.building,
-  s.floor,
-  s.locationDescription,
-  jsonParam(s.openingHours ?? null),
-  s.latitude ?? null,
-  s.longitude ?? null,
-  s.imageUrl ?? null,
-  jsonParam(s.tags ?? null),
-];
-
 export const suppliersRepository = {
   /** Inserts a supplier. Throws the unique violation on an active name+building clash. */
-  async insert(q: Queryable, s: NewSupplier): Promise<SupplierRow> {
-    const { rows } = await q.query<SupplierRow>(
-      `INSERT INTO suppliers (${INSERT_COLUMNS})
-       VALUES (${INSERT_VALUES})
-       RETURNING *`,
-      insertParams(s),
-    );
+  async insert(db: Database, s: NewSupplier): Promise<SupplierRow> {
+    const rows = await db.insert(suppliers).values(insertValues(s)).returning();
     return rows[0]!;
   },
 
   /** Insert-if-absent, keyed on the stable primary key. Returns the row only when it was created. */
-  async insertIfAbsent(q: Queryable, s: NewSupplier): Promise<SupplierRow | null> {
-    const { rows } = await q.query<SupplierRow>(
-      `INSERT INTO suppliers (${INSERT_COLUMNS})
-       VALUES (${INSERT_VALUES})
-       ON CONFLICT (supplier_id) DO NOTHING
-       RETURNING *`,
-      insertParams(s),
-    );
+  async insertIfAbsent(db: Database, s: NewSupplier): Promise<SupplierRow | null> {
+    const rows = await db
+      .insert(suppliers)
+      .values(insertValues(s))
+      .onConflictDoNothing({ target: suppliers.supplierId })
+      .returning();
     return rows[0] ?? null;
   },
 
   /** A single supplier by id, active or not — a deactivated supplier stays resolvable. */
-  async findById(q: Queryable, id: string): Promise<SupplierRow | null> {
-    const { rows } = await q.query<SupplierRow>(`SELECT * FROM suppliers WHERE supplier_id = $1`, [
-      id,
-    ]);
+  async findById(db: Database, id: string): Promise<SupplierRow | null> {
+    const rows = await db.select().from(suppliers).where(eq(suppliers.supplierId, id));
     return rows[0] ?? null;
   },
 
   /** Active suppliers only, for listings (SUP-02 adds filter/sort/pagination on top). */
-  async listActive(q: Queryable): Promise<SupplierRow[]> {
-    const { rows } = await q.query<SupplierRow>(
-      `SELECT * FROM suppliers WHERE active ORDER BY name, building`,
-    );
-    return rows;
+  async listActive(db: Database): Promise<SupplierRow[]> {
+    return db
+      .select()
+      .from(suppliers)
+      .where(eq(suppliers.active, true))
+      .orderBy(suppliers.name, suppliers.building);
   },
 
   /**
@@ -102,25 +97,24 @@ export const suppliersRepository = {
    * if the version did not match (a stale edit) or the row does not exist.
    */
   async update(
-    q: Queryable,
+    db: Database,
     id: string,
     expectedVersion: number,
     changes: Partial<SupplierInput>,
   ): Promise<SupplierRow | null> {
-    const sets: string[] = ['version = version + 1', 'updated_at = now()'];
-    const params: unknown[] = [id, expectedVersion];
-    for (const [key, meta] of Object.entries(UPDATABLE)) {
-      if (!(key in changes)) continue;
-      const value = changes[key as keyof SupplierInput];
-      params.push(meta.json ? jsonParam(value) : (value ?? null));
-      sets.push(`${meta.column} = $${params.length}${meta.json ? '::jsonb' : ''}`);
+    const set: PgUpdateSetSource<typeof suppliers> = {
+      version: sql`${suppliers.version} + 1`,
+      updatedAt: sql`now()`,
+    };
+    for (const key of UPDATABLE_KEYS) {
+      // `in` (not a truthiness check) so an explicit null still clears a column.
+      if (key in changes) (set as Record<string, unknown>)[key] = changes[key] ?? null;
     }
-    const { rows } = await q.query<SupplierRow>(
-      `UPDATE suppliers SET ${sets.join(', ')}
-       WHERE supplier_id = $1 AND version = $2
-       RETURNING *`,
-      params,
-    );
+    const rows = await db
+      .update(suppliers)
+      .set(set)
+      .where(and(eq(suppliers.supplierId, id), eq(suppliers.version, expectedVersion)))
+      .returning();
     return rows[0] ?? null;
   },
 
@@ -130,13 +124,18 @@ export const suppliersRepository = {
    * missing, already inactive, or at a different version. The service reads the
    * row back to tell those cases apart (idempotent no-op vs. 404 vs. 412).
    */
-  async deactivate(q: Queryable, id: string, expectedVersion: number): Promise<SupplierRow | null> {
-    const { rows } = await q.query<SupplierRow>(
-      `UPDATE suppliers SET active = false, version = version + 1, updated_at = now()
-       WHERE supplier_id = $1 AND version = $2 AND active
-       RETURNING *`,
-      [id, expectedVersion],
-    );
+  async deactivate(db: Database, id: string, expectedVersion: number): Promise<SupplierRow | null> {
+    const rows = await db
+      .update(suppliers)
+      .set({ active: false, version: sql`${suppliers.version} + 1`, updatedAt: sql`now()` })
+      .where(
+        and(
+          eq(suppliers.supplierId, id),
+          eq(suppliers.version, expectedVersion),
+          eq(suppliers.active, true),
+        ),
+      )
+      .returning();
     return rows[0] ?? null;
   },
 
@@ -146,31 +145,31 @@ export const suppliersRepository = {
    * matching request but reject a reused key carrying a different body.
    */
   async findIdempotent(
-    q: Queryable,
+    db: Database,
     key: string,
   ): Promise<{ supplierId: string; requestHash: string } | null> {
-    const { rows } = await q.query<{ supplier_id: string; request_hash: string }>(
-      `SELECT supplier_id, request_hash FROM supplier_idempotency_keys WHERE idempotency_key = $1`,
-      [key],
-    );
-    const row = rows[0];
-    return row ? { supplierId: row.supplier_id, requestHash: row.request_hash } : null;
+    const rows = await db
+      .select({
+        supplierId: supplierIdempotencyKeys.supplierId,
+        requestHash: supplierIdempotencyKeys.requestHash,
+      })
+      .from(supplierIdempotencyKeys)
+      .where(eq(supplierIdempotencyKeys.idempotencyKey, key));
+    return rows[0] ?? null;
   },
 
   /** Claims a key for a supplier, storing the request hash. Returns false if another request already claimed it. */
   async claimIdempotencyKey(
-    q: Queryable,
+    db: Database,
     key: string,
     supplierId: string,
     requestHash: string,
   ): Promise<boolean> {
-    const { rows } = await q.query(
-      `INSERT INTO supplier_idempotency_keys (idempotency_key, supplier_id, request_hash)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (idempotency_key) DO NOTHING
-       RETURNING idempotency_key`,
-      [key, supplierId, requestHash],
-    );
+    const rows = await db
+      .insert(supplierIdempotencyKeys)
+      .values({ idempotencyKey: key, supplierId, requestHash })
+      .onConflictDoNothing({ target: supplierIdempotencyKeys.idempotencyKey })
+      .returning({ idempotencyKey: supplierIdempotencyKeys.idempotencyKey });
     return rows.length > 0;
   },
 };

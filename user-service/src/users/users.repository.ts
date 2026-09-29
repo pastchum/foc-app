@@ -1,4 +1,7 @@
-import type { Queryable } from '../db/db.js';
+import { and, eq, gt, isNull, sql } from 'drizzle-orm';
+import type { PgUpdateSetSource } from 'drizzle-orm/pg-core';
+import type { Database } from '../db/db.js';
+import { activationTokens, outboxEvents, profiles, userRoles, users } from '../db/schema.js';
 
 export type AccountStatus = 'PENDING_ACTIVATION' | 'ACTIVE' | 'SUSPENDED';
 export type Role = 'STUDENT' | 'ADMIN';
@@ -16,87 +19,136 @@ export interface IdentityRow {
   displayName: string;
 }
 
+/** Postgres error code for a unique-constraint violation, shared by `pg` and PGlite. */
+const UNIQUE_VIOLATION = '23505';
+
+/** The unique index behind the case-insensitive email rule (`users (lower(email))`). */
+export const EMAIL_UNIQUE_INDEX = 'users_email_lower_key';
+
 /**
- * All SQL for the identity tables. Every function takes a {@link Queryable} so
+ * True when `err` is a unique-constraint violation (optionally on a named
+ * constraint). Drizzle wraps the driver error, carrying `code`/`constraint` on
+ * `.cause`; check both so it is recognised either way. Targeting the email index
+ * lets a genuine primary-key collision surface instead of being mistaken for a
+ * duplicate email.
+ */
+export const isUniqueViolation = (err: unknown, constraint?: string): boolean => {
+  const driver = (err as { cause?: unknown })?.cause ?? err;
+  const e = driver as { code?: string; constraint?: string } | null;
+  if (!e || e.code !== UNIQUE_VIOLATION) return false;
+  return constraint ? e.constraint === constraint : true;
+};
+
+/** A user's roles as a sorted array, correlated to the outer `users` row. */
+const rolesOf = sql<
+  Role[]
+>`array(SELECT r.role FROM user_roles r WHERE r.user_id = ${users.id} ORDER BY r.role)`;
+
+/** Profile columns a self-service update may set, in a fixed camelCase list. */
+const PROFILE_KEYS = [
+  'displayName',
+  'faculty',
+  'avatarRef',
+  'contactPreference',
+  'preferredMode',
+] as const;
+
+/**
+ * All SQL for the identity tables, expressed through Drizzle. Every function
+ * takes a {@link Database} — the top-level instance or a transaction handle — so
  * the service can run several of them in one transaction.
  */
 export const usersRepository = {
   /** Inserts the user, or returns false if the email is taken (unique index, race-safe). */
-  async insertUser(q: Queryable, user: NewUser): Promise<boolean> {
-    const { rows } = await q.query(
-      `INSERT INTO users (id, email, password_hash, status)
-       VALUES ($1, $2, $3, 'PENDING_ACTIVATION')
-       ON CONFLICT ((lower(email))) DO NOTHING
-       RETURNING id`,
-      [user.id, user.email, user.passwordHash],
-    );
-    if (rows.length === 0) return false;
-    await q.query(`INSERT INTO user_roles (user_id, role) VALUES ($1, 'STUDENT')`, [user.id]);
-    await q.query(`INSERT INTO profiles (user_id, display_name) VALUES ($1, $2)`, [
-      user.id,
-      user.displayName,
-    ]);
+  async insertUser(db: Database, user: NewUser): Promise<boolean> {
+    // Only a duplicate email is a "false" — any other violation (e.g. a
+    // primary-key collision) must surface, so target the email index rather than
+    // swallowing every conflict.
+    try {
+      await db.insert(users).values({
+        id: user.id,
+        email: user.email,
+        passwordHash: user.passwordHash,
+        status: 'PENDING_ACTIVATION',
+      });
+    } catch (err) {
+      if (isUniqueViolation(err, EMAIL_UNIQUE_INDEX)) return false;
+      throw err;
+    }
+    await db.insert(userRoles).values({ userId: user.id, role: 'STUDENT' });
+    await db.insert(profiles).values({ userId: user.id, displayName: user.displayName });
     return true;
   },
 
   async insertActivationToken(
-    q: Queryable,
+    db: Database,
     t: { id: string; userId: string; tokenHash: string; ttlHours: number },
   ): Promise<void> {
-    await q.query(
-      `INSERT INTO activation_tokens (id, user_id, token_hash, expires_at)
-       VALUES ($1, $2, $3, now() + make_interval(hours => $4))`,
-      [t.id, t.userId, t.tokenHash, t.ttlHours],
-    );
+    await db.insert(activationTokens).values({
+      id: t.id,
+      userId: t.userId,
+      tokenHash: t.tokenHash,
+      expiresAt: sql`now() + make_interval(hours => ${t.ttlHours})`,
+    });
   },
 
   /**
    * Atomically claims a live token. The conditional UPDATE is the single-use
    * guarantee: two concurrent callers cannot both get a row back.
    */
-  async consumeActivationToken(q: Queryable, tokenHash: string): Promise<string | null> {
-    const { rows } = await q.query<{ user_id: string }>(
-      `UPDATE activation_tokens SET consumed_at = now()
-       WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > now()
-       RETURNING user_id`,
-      [tokenHash],
-    );
-    return rows[0]?.user_id ?? null;
+  async consumeActivationToken(db: Database, tokenHash: string): Promise<string | null> {
+    const rows = await db
+      .update(activationTokens)
+      .set({ consumedAt: sql`now()` })
+      .where(
+        and(
+          eq(activationTokens.tokenHash, tokenHash),
+          isNull(activationTokens.consumedAt),
+          gt(activationTokens.expiresAt, sql`now()`),
+        ),
+      )
+      .returning({ userId: activationTokens.userId });
+    return rows[0]?.userId ?? null;
   },
 
   async findActivationToken(
-    q: Queryable,
+    db: Database,
     tokenHash: string,
   ): Promise<{ userId: string; consumed: boolean } | null> {
-    const { rows } = await q.query<{ user_id: string; consumed_at: unknown }>(
-      `SELECT user_id, consumed_at FROM activation_tokens WHERE token_hash = $1`,
-      [tokenHash],
-    );
+    const rows = await db
+      .select({ userId: activationTokens.userId, consumedAt: activationTokens.consumedAt })
+      .from(activationTokens)
+      .where(eq(activationTokens.tokenHash, tokenHash));
     const row = rows[0];
-    return row ? { userId: row.user_id, consumed: row.consumed_at !== null } : null;
+    return row ? { userId: row.userId, consumed: row.consumedAt !== null } : null;
   },
 
   /** Flips PENDING_ACTIVATION → ACTIVE once. Returns false if the account was not pending. */
-  async markActivated(q: Queryable, userId: string): Promise<boolean> {
-    const { rows } = await q.query(
-      `UPDATE users SET status = 'ACTIVE', activated_at = now(), updated_at = now()
-       WHERE id = $1 AND status = 'PENDING_ACTIVATION'
-       RETURNING id`,
-      [userId],
-    );
+  async markActivated(db: Database, userId: string): Promise<boolean> {
+    const rows = await db
+      .update(users)
+      .set({ status: 'ACTIVE', activatedAt: sql`now()`, updatedAt: sql`now()` })
+      .where(and(eq(users.id, userId), eq(users.status, 'PENDING_ACTIVATION')))
+      .returning({ id: users.id });
     return rows.length > 0;
   },
 
-  async isActivated(q: Queryable, userId: string): Promise<boolean> {
-    const { rows } = await q.query(
-      `SELECT 1 FROM users WHERE id = $1 AND status = 'ACTIVE' AND activated_at IS NOT NULL`,
-      [userId],
-    );
+  async isActivated(db: Database, userId: string): Promise<boolean> {
+    const rows = await db
+      .select({ one: sql`1` })
+      .from(users)
+      .where(
+        and(
+          eq(users.id, userId),
+          eq(users.status, 'ACTIVE'),
+          sql`${users.activatedAt} IS NOT NULL`,
+        ),
+      );
     return rows.length > 0;
   },
 
   async insertOutboxEvent(
-    q: Queryable,
+    db: Database,
     e: {
       id: string;
       eventType: string;
@@ -105,16 +157,18 @@ export const usersRepository = {
       correlationId: string;
     },
   ): Promise<void> {
-    await q.query(
-      `INSERT INTO outbox_events (id, event_type, aggregate_id, payload, correlation_id)
-       VALUES ($1, $2, $3, $4::jsonb, $5)`,
-      [e.id, e.eventType, e.aggregateId, JSON.stringify(e.payload), e.correlationId],
-    );
+    await db.insert(outboxEvents).values({
+      id: e.id,
+      eventType: e.eventType,
+      aggregateId: e.aggregateId,
+      payload: e.payload,
+      correlationId: e.correlationId,
+    });
   },
 
   /** Login lookup. The only place a password hash is read, and it never leaves the auth service. */
   async findCredentials(
-    q: Queryable,
+    db: Database,
     normalizedEmail: string,
   ): Promise<{
     id: string;
@@ -123,58 +177,44 @@ export const usersRepository = {
     displayName: string;
     roles: Role[];
   } | null> {
-    const { rows } = await q.query<{
-      id: string;
-      password_hash: string;
-      status: AccountStatus;
-      display_name: string;
-      roles: Role[];
-    }>(
-      `SELECT u.id, u.password_hash, u.status, coalesce(p.display_name, '') AS display_name,
-              array(SELECT r.role FROM user_roles r WHERE r.user_id = u.id ORDER BY r.role) AS roles
-       FROM users u LEFT JOIN profiles p ON p.user_id = u.id
-       WHERE lower(u.email) = lower($1)`,
-      [normalizedEmail],
-    );
-    const r = rows[0];
-    return r
-      ? {
-          id: r.id,
-          passwordHash: r.password_hash,
-          status: r.status,
-          displayName: r.display_name,
-          roles: r.roles,
-        }
-      : null;
+    const rows = await db
+      .select({
+        id: users.id,
+        passwordHash: users.passwordHash,
+        status: users.status,
+        displayName: sql<string>`coalesce(${profiles.displayName}, '')`,
+        roles: rolesOf,
+      })
+      .from(users)
+      .leftJoin(profiles, eq(profiles.userId, users.id))
+      .where(sql`lower(${users.email}) = lower(${normalizedEmail})`);
+    return rows[0] ?? null;
   },
 
   /** The caller's own account for `GET /users/me`. */
-  async findMe(q: Queryable, userId: string) {
-    const { rows } = await q.query<{
-      id: string;
-      email: string;
-      status: AccountStatus;
-      created_at: Date;
-      display_name: string;
-      faculty: string | null;
-      avatar_ref: string | null;
-      contact_preference: string;
-      preferred_mode: string;
-      roles: Role[];
-    }>(
-      `SELECT u.id, u.email, u.status, u.created_at, p.display_name, p.faculty, p.avatar_ref,
-              p.contact_preference, p.preferred_mode,
-              array(SELECT r.role FROM user_roles r WHERE r.user_id = u.id ORDER BY r.role) AS roles
-       FROM users u JOIN profiles p ON p.user_id = u.id
-       WHERE u.id = $1`,
-      [userId],
-    );
+  async findMe(db: Database, userId: string) {
+    const rows = await db
+      .select({
+        id: users.id,
+        email: users.email,
+        status: users.status,
+        createdAt: users.createdAt,
+        displayName: profiles.displayName,
+        faculty: profiles.faculty,
+        avatarRef: profiles.avatarRef,
+        contactPreference: profiles.contactPreference,
+        preferredMode: profiles.preferredMode,
+        roles: rolesOf,
+      })
+      .from(users)
+      .innerJoin(profiles, eq(profiles.userId, users.id))
+      .where(eq(users.id, userId));
     return rows[0] ?? null;
   },
 
   /** Applies only the fields present. Column names come from a fixed map, never from input. */
   async updateProfile(
-    q: Queryable,
+    db: Database,
     userId: string,
     changes: Partial<{
       displayName: string;
@@ -184,36 +224,26 @@ export const usersRepository = {
       preferredMode: string;
     }>,
   ): Promise<void> {
-    const columns = {
-      displayName: 'display_name',
-      faculty: 'faculty',
-      avatarRef: 'avatar_ref',
-      contactPreference: 'contact_preference',
-      preferredMode: 'preferred_mode',
-    } as const;
-    const sets: string[] = [];
-    const params: unknown[] = [userId];
-    for (const [key, column] of Object.entries(columns)) {
-      const value = changes[key as keyof typeof columns];
-      if (value !== undefined) {
-        params.push(value);
-        sets.push(`${column} = $${params.length}`);
-      }
+    const set: PgUpdateSetSource<typeof profiles> = {};
+    for (const key of PROFILE_KEYS) {
+      if (changes[key] !== undefined) (set as Record<string, unknown>)[key] = changes[key];
     }
-    if (sets.length === 0) return;
-    await q.query(`UPDATE profiles SET ${sets.join(', ')} WHERE user_id = $1`, params);
+    if (Object.keys(set).length === 0) return;
+    await db.update(profiles).set(set).where(eq(profiles.userId, userId));
   },
 
   /** Deliberately selects only what the least-data lookup may return — never a hash or token. */
-  async findIdentity(q: Queryable, userId: string): Promise<IdentityRow | null> {
-    const { rows } = await q.query<{ status: AccountStatus; display_name: string; roles: Role[] }>(
-      `SELECT u.status, coalesce(p.display_name, '') AS display_name,
-              array(SELECT r.role FROM user_roles r WHERE r.user_id = u.id ORDER BY r.role) AS roles
-       FROM users u LEFT JOIN profiles p ON p.user_id = u.id
-       WHERE u.id = $1`,
-      [userId],
-    );
+  async findIdentity(db: Database, userId: string): Promise<IdentityRow | null> {
+    const rows = await db
+      .select({
+        status: users.status,
+        displayName: sql<string>`coalesce(${profiles.displayName}, '')`,
+        roles: rolesOf,
+      })
+      .from(users)
+      .leftJoin(profiles, eq(profiles.userId, users.id))
+      .where(eq(users.id, userId));
     const row = rows[0];
-    return row ? { status: row.status, roles: row.roles, displayName: row.display_name } : null;
+    return row ? { status: row.status, roles: row.roles, displayName: row.displayName } : null;
   },
 };

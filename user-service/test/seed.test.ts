@@ -18,7 +18,7 @@ beforeEach(async () => {
 
 describe('seedAdmins (US-FR3.1.3)', () => {
   it('creates active, seeded administrators who can log in, with hashed passwords', async () => {
-    const r = await seedAdmins(t.db, {
+    const r = await seedAdmins(t.orm, {
       emails: ['Root@U.NUS.edu'],
       password: PASSWORD,
       allowedDomains: domains,
@@ -42,14 +42,14 @@ describe('seedAdmins (US-FR3.1.3)', () => {
 
   it('is idempotent across restarts', async () => {
     const cfg = { emails: ['root@u.nus.edu'], password: PASSWORD, allowedDomains: domains };
-    await seedAdmins(t.db, cfg);
-    const again = await seedAdmins(t.db, cfg);
+    await seedAdmins(t.orm, cfg);
+    const again = await seedAdmins(t.orm, cfg);
     expect(again).toEqual({ created: [], skipped: ['root@u.nus.edu'] });
     expect((await t.db.query('SELECT 1 FROM users')).rows).toHaveLength(1);
   });
 
   it('issues a wallet event for the seeded admin like any other student', async () => {
-    await seedAdmins(t.db, {
+    await seedAdmins(t.orm, {
       emails: ['root@u.nus.edu'],
       password: PASSWORD,
       allowedDomains: domains,
@@ -61,7 +61,7 @@ describe('seedAdmins (US-FR3.1.3)', () => {
 
   it('never promotes an address that already has an ordinary account', async () => {
     await activeStudent(t, 'alex@u.nus.edu');
-    const r = await seedAdmins(t.db, {
+    const r = await seedAdmins(t.orm, {
       emails: ['alex@u.nus.edu'],
       password: PASSWORD,
       allowedDomains: domains,
@@ -74,12 +74,12 @@ describe('seedAdmins (US-FR3.1.3)', () => {
 
   it('fails loudly on a misconfiguration', async () => {
     await expect(
-      seedAdmins(t.db, { emails: ['a@gmail.com'], password: PASSWORD, allowedDomains: domains }),
+      seedAdmins(t.orm, { emails: ['a@gmail.com'], password: PASSWORD, allowedDomains: domains }),
     ).rejects.toThrow(/outside ALLOWED_EMAIL_DOMAINS/);
     await expect(
-      seedAdmins(t.db, { emails: ['a@u.nus.edu'], allowedDomains: domains }),
+      seedAdmins(t.orm, { emails: ['a@u.nus.edu'], allowedDomains: domains }),
     ).rejects.toThrow(/ADMIN_SEED_PASSWORD/);
-    expect(await seedAdmins(t.db, { allowedDomains: domains })).toEqual({
+    expect(await seedAdmins(t.orm, { allowedDomains: domains })).toEqual({
       created: [],
       skipped: [],
     });

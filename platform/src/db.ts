@@ -1,9 +1,48 @@
 import pg from 'pg';
+import type { ExtractTablesWithRelations } from 'drizzle-orm';
+import type { PgDatabase, PgQueryResultHKT } from 'drizzle-orm/pg-core';
 
 /**
- * The narrow database port the service codes against. Production uses `pg`
- * (see {@link PgDb}); tests run the same SQL on PGlite, which is real PostgreSQL
- * compiled to WASM, so no server is needed to run the suite.
+ * The Drizzle handle a service's repositories code against. It is deliberately
+ * widened over {@link PgQueryResultHKT} (rather than a driver-specific result
+ * type) so that *both* the top-level database and a transaction handle — over
+ * `pg` in production or PGlite in tests — satisfy it. A repository function
+ * typed to this can therefore run standalone or inside `db.transaction(...)`
+ * against either driver.
+ */
+export type DrizzleDatabase<TSchema extends Record<string, unknown> = Record<string, never>> =
+  PgDatabase<PgQueryResultHKT, TSchema, ExtractTablesWithRelations<TSchema>>;
+
+/**
+ * A `pg` connection pool with the idle-error listener attached (see {@link PgDb}
+ * for why). Shared so the same pool is used whether a caller wants the raw
+ * {@link Db} port (migrations) or a Drizzle instance built over it (queries).
+ */
+export function createPgPool(connectionString: string): pg.Pool {
+  const pool = new pg.Pool({ connectionString, max: 10 });
+
+  // node-postgres emits 'error' on the pool when an *idle* client's connection
+  // drops out from under us (Postgres restart, network blip). That event fires
+  // outside any query's promise, so with no listener it is an unhandled
+  // EventEmitter error and Node exits the whole process. Log and swallow it:
+  // the broken client is discarded automatically, and the next query
+  // transparently opens a fresh connection. This runs with no request context
+  // and no logger injected, so — like the pre-logger startup path in main.ts —
+  // console is the available sink.
+  pool.on('error', (err) => {
+    console.error(
+      `Idle Postgres client error (connection dropped, will reconnect): ${err.message}`,
+    );
+  });
+  return pool;
+}
+
+/**
+ * The narrow database port used for migrations (multi-statement DDL, which the
+ * extended-protocol query path Drizzle uses cannot run) and, in tests, for raw
+ * assertions. Production uses `pg` (see {@link PgDb}); tests run the same SQL on
+ * PGlite, which is real PostgreSQL compiled to WASM, so no server is needed to
+ * run the suite. Application queries go through Drizzle, not this port.
  */
 export type Row = Record<string, unknown>;
 
@@ -24,21 +63,7 @@ export class PgDb implements Db {
   private readonly pool: pg.Pool;
 
   constructor(connectionString: string) {
-    this.pool = new pg.Pool({ connectionString, max: 10 });
-
-    // node-postgres emits 'error' on the pool when an *idle* client's connection
-    // drops out from under us (Postgres restart, network blip). That event fires
-    // outside any query's promise, so with no listener it is an unhandled
-    // EventEmitter error and Node exits the whole process. Log and swallow it:
-    // the broken client is discarded automatically, and the next query
-    // transparently opens a fresh connection. This runs with no request context,
-    // and PgDb is built by a useFactory with no logger injected, so — like the
-    // pre-logger startup path in main.ts — console is the available sink.
-    this.pool.on('error', (err) => {
-      console.error(
-        `Idle Postgres client error (connection dropped, will reconnect): ${err.message}`,
-      );
-    });
+    this.pool = createPgPool(connectionString);
   }
 
   async query<T extends Row = Row>(sql: string, params?: unknown[]): Promise<{ rows: T[] }> {

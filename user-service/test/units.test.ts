@@ -1,8 +1,10 @@
+import { drizzle } from 'drizzle-orm/pglite';
 import { afterAll, describe, expect, it } from 'vitest';
 import { hashPassword, verifyPassword } from '../src/auth/passwords.js';
 import { newOpaqueToken, sha256Hex } from '../src/auth/tokens.js';
 import { runMigrations } from '@foc/platform';
 import { migrations } from '../src/db/migrations.js';
+import * as schema from '../src/db/schema.js';
 import { isAllowedDomain, normalizeEmail } from '../src/users/email.js';
 import { usersRepository } from '../src/users/users.repository.js';
 import { PgliteDb } from './helpers/pglite-db.js';
@@ -92,8 +94,9 @@ describe('migrations', () => {
 
 describe('insertUser conflict handling', () => {
   it('skips only a duplicate email; any other constraint violation still surfaces', async () => {
-    const db = await PgliteDb.create();
-    await runMigrations(db, migrations);
+    const raw = await PgliteDb.create();
+    await runMigrations(raw, migrations);
+    const db = drizzle(raw.client, { schema });
     const base = { passwordHash: 'h', displayName: 'A' };
     const id1 = '00000000-0000-4000-8000-0000000000a1';
 
@@ -108,10 +111,14 @@ describe('insertUser conflict handling', () => {
         email: 'A@U.NUS.EDU',
       }),
     ).toBe(false);
-    // a primary-key collision is a real error and must not be swallowed as "duplicate email"
-    await expect(
-      usersRepository.insertUser(db, { ...base, id: id1, email: 'other@u.nus.edu' }),
-    ).rejects.toThrow(/duplicate key/);
-    await db.close();
+    // a primary-key collision is a real error and must not be swallowed as "duplicate email".
+    // Drizzle wraps the driver error, so the "duplicate key" text is on the cause.
+    const err = await usersRepository
+      .insertUser(db, { ...base, id: id1, email: 'other@u.nus.edu' })
+      .then(() => null)
+      .catch((e: { cause?: { message?: string }; message?: string }) => e);
+    expect(err).not.toBeNull();
+    expect(err?.cause?.message ?? err?.message).toMatch(/duplicate key/);
+    await raw.close();
   });
 });

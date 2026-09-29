@@ -1,4 +1,4 @@
-import type { Db } from '../db/db.js';
+import type { Database } from '../db/db.js';
 import {
   isUniqueViolation,
   suppliersRepository as repo,
@@ -21,7 +21,7 @@ export interface SeedResult {
  * FoC-Template), plus `data/csv/supplier-seed-additions.csv` (this team's
  * additions). See `supplier-service/README.md` for attribution.
  */
-export async function seedSuppliers(db: Db, suppliers: SupplierSeed[]): Promise<SeedResult> {
+export async function seedSuppliers(db: Database, suppliers: SupplierSeed[]): Promise<SeedResult> {
   const result: SeedResult = { created: [], skipped: [] };
   for (const supplier of suppliers) {
     const label = `${supplier.name} @ ${supplier.building}`;

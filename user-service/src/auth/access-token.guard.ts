@@ -1,7 +1,7 @@
 import { CanActivate, ExecutionContext, Inject, Injectable } from '@nestjs/common';
 import type { Request } from 'express';
 import { ApiException } from '@foc/platform';
-import { DB, type Db } from '../db/db.js';
+import { DB, type Database } from '../db/db.js';
 import { JWT, type JwtService } from './jwt.service.js';
 import { sessionsRepository as sessions } from './sessions.repository.js';
 
@@ -23,7 +23,7 @@ const unauthenticated = () => new ApiException(401, 'UNAUTHENTICATED', 'Authenti
 export class AccessTokenGuard implements CanActivate {
   constructor(
     @Inject(JWT) private readonly jwt: JwtService,
-    @Inject(DB) private readonly db: Db,
+    @Inject(DB) private readonly db: Database,
   ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {

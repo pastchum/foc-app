@@ -1,6 +1,6 @@
 import { CanActivate, ExecutionContext, Inject, Injectable } from '@nestjs/common';
 import { ApiException } from '@foc/platform';
-import { DB, type Db } from '../db/db.js';
+import { DB, type Database } from '../db/db.js';
 import { usersRepository } from '../users/users.repository.js';
 import type { AuthedRequest } from './access-token.guard.js';
 
@@ -10,7 +10,7 @@ import type { AuthedRequest } from './access-token.guard.js';
  */
 @Injectable()
 export class AdminGuard implements CanActivate {
-  constructor(@Inject(DB) private readonly db: Db) {}
+  constructor(@Inject(DB) private readonly db: Database) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
     const req = context.switchToHttp().getRequest<AuthedRequest>();

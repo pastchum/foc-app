@@ -21,5 +21,10 @@ Thumbs.db
 coverage/
 *.tsbuildinfo
 
+# drizzle-kit generated output (`db:generate`). The authoritative migrations
+# applied at boot are the TypeScript strings in each service's db/migrations.ts;
+# this folder is a derivable convenience for inspection/studio only.
+*/drizzle/
+
 # oh-my-claudecode plugin state (local, per-session)
 .omc/

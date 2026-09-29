@@ -4,7 +4,7 @@ import { ApiException } from '@foc/platform';
 import { hashPassword } from '../auth/passwords.js';
 import { sessionsRepository as sessions } from '../auth/sessions.repository.js';
 import { newOpaqueToken, sha256Hex } from '../auth/tokens.js';
-import { DB, type Db } from '../db/db.js';
+import { DB, type Database } from '../db/db.js';
 import { MAILER, type Mailer } from '../mail/mailer.js';
 import { isAllowedDomain, normalizeEmail } from './email.js';
 import { usersRepository as repo, type AccountStatus, type Role } from './users.repository.js';
@@ -46,7 +46,7 @@ export interface PermissionsLookup {
 @Injectable()
 export class UsersService {
   constructor(
-    @Inject(DB) private readonly db: Db,
+    @Inject(DB) private readonly db: Database,
     @Inject(MAILER) private readonly mailer: Mailer,
     @Inject(USER_SETTINGS) private readonly settings: UserSettings,
   ) {}

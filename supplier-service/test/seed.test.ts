@@ -1,5 +1,8 @@
+import { drizzle } from 'drizzle-orm/pglite';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { runMigrations } from '@foc/platform';
+import type { Database } from '../src/db/db.js';
+import * as schema from '../src/db/schema.js';
 import { migrations } from '../src/db/migrations.js';
 import { loadSeedSuppliers } from '../src/admin/seed-data.js';
 import { seedSuppliers } from '../src/admin/seed.js';
@@ -7,22 +10,27 @@ import { suppliersRepository as repo } from '../src/suppliers/suppliers.reposito
 import type { SupplierSeed } from '../src/admin/normalize.js';
 import { PgliteDb } from './helpers/pglite-db.js';
 
-let db: PgliteDb;
+// `raw` runs the migrations and backs the direct SQL assertions; `db` is the
+// Drizzle handle the seed and repository actually query through — both over the
+// same PGlite (mirroring how the service is wired in production).
+let raw: PgliteDb;
+let db: Database;
 let seeds: SupplierSeed[];
 
 beforeAll(async () => {
   seeds = await loadSeedSuppliers();
 });
 beforeEach(async () => {
-  db = await PgliteDb.create();
-  await runMigrations(db, migrations);
+  raw = await PgliteDb.create();
+  await runMigrations(raw, migrations);
+  db = drizzle(raw.client, { schema });
 });
 afterAll(async () => {
-  await db?.close();
+  await raw?.close();
 });
 
 const count = async () =>
-  Number((await db.query<{ n: string }>('SELECT count(*) AS n FROM suppliers')).rows[0]!.n);
+  Number((await raw.query<{ n: string }>('SELECT count(*) AS n FROM suppliers')).rows[0]!.n);
 
 describe('the seed corpus (SS-FR4.1.1)', () => {
   it('loads every template row without a validation error', async () => {
@@ -74,7 +82,7 @@ describe('seedSuppliers (idempotent, stable)', () => {
   it('three consecutive runs keep the same count and identifiers', async () => {
     await seedSuppliers(db, seeds);
     const idsAfterFirst = (
-      await db.query<{ supplier_id: string }>(
+      await raw.query<{ supplier_id: string }>(
         'SELECT supplier_id FROM suppliers ORDER BY supplier_id',
       )
     ).rows;
@@ -86,7 +94,7 @@ describe('seedSuppliers (idempotent, stable)', () => {
     expect(third.created).toHaveLength(0);
 
     const idsAfterThird = (
-      await db.query<{ supplier_id: string }>(
+      await raw.query<{ supplier_id: string }>(
         'SELECT supplier_id FROM suppliers ORDER BY supplier_id',
       )
     ).rows;
@@ -97,14 +105,14 @@ describe('seedSuppliers (idempotent, stable)', () => {
   it('never overwrites an admin edit made between runs', async () => {
     await seedSuppliers(db, seeds);
     const target = seeds[0]!;
-    await db.query(
+    await raw.query(
       `UPDATE suppliers SET location_description = 'ADMIN EDITED', version = version + 1 WHERE supplier_id = $1`,
       [target.supplierId],
     );
 
     await seedSuppliers(db, seeds); // a re-run must leave the edit alone
     const row = await repo.findById(db, target.supplierId);
-    expect(row?.location_description).toBe('ADMIN EDITED');
+    expect(row?.locationDescription).toBe('ADMIN EDITED');
     expect(row?.version).toBe(2);
   });
 

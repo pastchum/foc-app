@@ -1,5 +1,12 @@
-import type { Queryable } from '../db/db.js';
-import type { AccountStatus, Role } from '../users/users.repository.js';
+import { and, eq, sql, type SQL } from 'drizzle-orm';
+import type { Database } from '../db/db.js';
+import { auditRecords, profiles, userRoles, users } from '../db/schema.js';
+import {
+  EMAIL_UNIQUE_INDEX,
+  isUniqueViolation,
+  type AccountStatus,
+  type Role,
+} from '../users/users.repository.js';
 
 export type AuditAction = 'SUSPEND' | 'REACTIVATE' | 'ROLE_GRANT' | 'ROLE_REVOKE';
 
@@ -10,71 +17,94 @@ export interface LockedUser {
   roles: Role[];
 }
 
-const ROLES = `array(SELECT r.role FROM user_roles r WHERE r.user_id = u.id ORDER BY r.role)`;
+/** A user's roles as a sorted array, correlated to the outer `users` row. */
+const rolesOf = sql<
+  Role[]
+>`array(SELECT r.role FROM user_roles r WHERE r.user_id = ${users.id} ORDER BY r.role)`;
 
 /** Escapes LIKE wildcards so a search for `50%` matches the text, not everything. */
 const likePrefix = (q: string) => q.replace(/[\\%_]/g, (c) => `\\${c}`).toLowerCase() + '%';
 
-/** SQL for administration. Every function takes a {@link Queryable} so a whole action shares one transaction. */
+/**
+ * The projection every admin read of a user shares — never a password hash.
+ * `coalesce`s cover the LEFT JOIN missing a profile row.
+ */
+const adminUserColumns = {
+  id: users.id,
+  email: users.email,
+  status: users.status,
+  isSeededAdmin: users.isSeededAdmin,
+  createdAt: users.createdAt,
+  activatedAt: users.activatedAt,
+  displayName: sql<string>`coalesce(${profiles.displayName}, '')`,
+  faculty: profiles.faculty,
+  avatarRef: profiles.avatarRef,
+  contactPreference: sql<string>`coalesce(${profiles.contactPreference}, 'IN_APP')`,
+  preferredMode: sql<string>`coalesce(${profiles.preferredMode}, 'REQUESTER')`,
+  roles: rolesOf,
+};
+
+/** SQL for administration. Every function takes a {@link Database} so a whole action shares one transaction. */
 export const adminRepository = {
   /**
    * Locks every ADMIN role row. Taken first by anything that could reduce the
    * number of administrators, so two simultaneous demotions are serialised and
    * cannot both pass the "at least one admin" check.
    */
-  async lockAdminIds(q: Queryable): Promise<string[]> {
-    const { rows } = await q.query<{ user_id: string }>(
-      `SELECT user_id FROM user_roles WHERE role = 'ADMIN' ORDER BY user_id FOR UPDATE`,
-    );
-    return rows.map((r) => r.user_id);
+  async lockAdminIds(db: Database): Promise<string[]> {
+    const rows = await db
+      .select({ userId: userRoles.userId })
+      .from(userRoles)
+      .where(eq(userRoles.role, 'ADMIN'))
+      .orderBy(userRoles.userId)
+      .for('update');
+    return rows.map((r) => r.userId);
   },
 
-  async lockUser(q: Queryable, userId: string): Promise<LockedUser | null> {
-    const { rows } = await q.query<{
-      id: string;
-      status: AccountStatus;
-      is_seeded_admin: boolean;
-      roles: Role[];
-    }>(
-      `SELECT u.id, u.status, u.is_seeded_admin, ${ROLES} AS roles
-       FROM users u WHERE u.id = $1 FOR UPDATE`,
-      [userId],
-    );
-    const r = rows[0];
-    return r
-      ? { id: r.id, status: r.status, isSeededAdmin: r.is_seeded_admin, roles: r.roles }
-      : null;
+  async lockUser(db: Database, userId: string): Promise<LockedUser | null> {
+    const rows = await db
+      .select({
+        id: users.id,
+        status: users.status,
+        isSeededAdmin: users.isSeededAdmin,
+        roles: rolesOf,
+      })
+      .from(users)
+      .where(eq(users.id, userId))
+      .for('update');
+    return rows[0] ?? null;
   },
 
-  async isSeededAdmin(q: Queryable, userId: string): Promise<boolean> {
-    const { rows } = await q.query<{ is_seeded_admin: boolean }>(
-      `SELECT is_seeded_admin FROM users WHERE id = $1`,
-      [userId],
-    );
-    return rows[0]?.is_seeded_admin === true;
+  async isSeededAdmin(db: Database, userId: string): Promise<boolean> {
+    const rows = await db
+      .select({ isSeededAdmin: users.isSeededAdmin })
+      .from(users)
+      .where(eq(users.id, userId));
+    return rows[0]?.isSeededAdmin === true;
   },
 
-  async setStatus(q: Queryable, userId: string, status: AccountStatus): Promise<void> {
-    await q.query(`UPDATE users SET status = $2, updated_at = now() WHERE id = $1`, [
-      userId,
-      status,
-    ]);
+  async setStatus(db: Database, userId: string, status: AccountStatus): Promise<void> {
+    await db
+      .update(users)
+      .set({ status, updatedAt: sql`now()` })
+      .where(eq(users.id, userId));
   },
 
-  async grantAdmin(q: Queryable, userId: string, grantedBy: string): Promise<void> {
-    await q.query(
-      `INSERT INTO user_roles (user_id, role, granted_by) VALUES ($1, 'ADMIN', $2)
-       ON CONFLICT (user_id, role) DO NOTHING`,
-      [userId, grantedBy],
-    );
+  async grantAdmin(db: Database, userId: string, grantedBy: string): Promise<void> {
+    await db
+      .insert(userRoles)
+      .values({ userId, role: 'ADMIN', grantedBy })
+      .onConflictDoNothing({ target: [userRoles.userId, userRoles.role] });
   },
 
-  async revokeAdmin(q: Queryable, userId: string): Promise<void> {
-    await q.query(`DELETE FROM user_roles WHERE user_id = $1 AND role = 'ADMIN'`, [userId]);
+  async revokeAdmin(db: Database, userId: string): Promise<void> {
+    await db
+      .delete(userRoles)
+      .where(and(eq(userRoles.userId, userId), eq(userRoles.role, 'ADMIN')));
   },
 
   async insertAudit(
-    q: Queryable,
+    db: Database,
     a: {
       id: string;
       actorId: string;
@@ -84,127 +114,139 @@ export const adminRepository = {
       correlationId: string;
     },
   ): Promise<void> {
-    await q.query(
-      `INSERT INTO audit_records (id, actor_id, target_user_id, action, reason, correlation_id)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [a.id, a.actorId, a.targetUserId, a.action, a.reason, a.correlationId],
-    );
+    await db.insert(auditRecords).values({
+      id: a.id,
+      actorId: a.actorId,
+      targetUserId: a.targetUserId,
+      action: a.action,
+      reason: a.reason,
+      correlationId: a.correlationId,
+    });
   },
 
   /** Ordinary users are never returned with a hash; this view is the only place an admin reads an account. */
-  async findAdminUser(q: Queryable, userId: string) {
-    const { rows } = await q.query<AdminUserRow>(`${ADMIN_USER_SELECT} WHERE u.id = $1`, [userId]);
+  async findAdminUser(db: Database, userId: string): Promise<AdminUserRow | null> {
+    const rows = await db
+      .select(adminUserColumns)
+      .from(users)
+      .leftJoin(profiles, eq(profiles.userId, users.id))
+      .where(eq(users.id, userId));
     return rows[0] ?? null;
   },
 
   async listUsers(
-    q: Queryable,
+    db: Database,
     f: { page: number; pageSize: number; status?: string; role?: string; q?: string },
-  ) {
-    const where: string[] = [];
-    const params: unknown[] = [];
-    const add = (sql: string, v: unknown) => {
-      params.push(v);
-      where.push(sql.replace('?', `$${params.length}`));
-    };
-    if (f.status) add('u.status = ?', f.status);
-    if (f.role)
-      add('EXISTS (SELECT 1 FROM user_roles r WHERE r.user_id = u.id AND r.role = ?)', f.role);
-    if (f.q) {
-      params.push(likePrefix(f.q));
-      const n = params.length;
-      where.push(
-        `(lower(u.email) LIKE $${n} ESCAPE '\\' OR lower(p.display_name) LIKE $${n} ESCAPE '\\')`,
+  ): Promise<{ rows: AdminUserRow[]; total: number }> {
+    const conditions: SQL[] = [];
+    if (f.status) conditions.push(eq(users.status, f.status as AccountStatus));
+    if (f.role) {
+      conditions.push(
+        sql`EXISTS (SELECT 1 FROM user_roles r WHERE r.user_id = ${users.id} AND r.role = ${f.role})`,
       );
     }
-    const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    if (f.q) {
+      const like = likePrefix(f.q);
+      conditions.push(
+        sql`(lower(${users.email}) LIKE ${like} ESCAPE '\' OR lower(${profiles.displayName}) LIKE ${like} ESCAPE '\')`,
+      );
+    }
+    const where = conditions.length ? and(...conditions) : undefined;
 
-    const total = await q.query<{ n: number }>(
-      `SELECT count(*)::int AS n FROM users u LEFT JOIN profiles p ON p.user_id = u.id ${clause}`,
-      params,
-    );
-    const { rows } = await q.query<AdminUserRow>(
-      `${ADMIN_USER_SELECT} ${clause} ORDER BY u.created_at, u.id
-       LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
-      [...params, f.pageSize, (f.page - 1) * f.pageSize],
-    );
-    return { rows, total: total.rows[0]?.n ?? 0 };
+    const totalRows = await db
+      .select({ n: sql<number>`count(*)::int` })
+      .from(users)
+      .leftJoin(profiles, eq(profiles.userId, users.id))
+      .where(where);
+    const rows = await db
+      .select(adminUserColumns)
+      .from(users)
+      .leftJoin(profiles, eq(profiles.userId, users.id))
+      .where(where)
+      .orderBy(users.createdAt, users.id)
+      .limit(f.pageSize)
+      .offset((f.page - 1) * f.pageSize);
+    return { rows, total: totalRows[0]?.n ?? 0 };
   },
 
-  async listAudit(q: Queryable, f: { page: number; pageSize: number; targetUserId?: string }) {
-    const params: unknown[] = [];
-    let clause = '';
-    if (f.targetUserId) {
-      params.push(f.targetUserId);
-      clause = 'WHERE target_user_id = $1';
-    }
-    const total = await q.query<{ n: number }>(
-      `SELECT count(*)::int AS n FROM audit_records ${clause}`,
-      params,
-    );
-    const { rows } = await q.query<AuditRow>(
-      `SELECT id, actor_id, target_user_id, action, reason, occurred_at, correlation_id
-       FROM audit_records ${clause}
-       ORDER BY occurred_at DESC, id
-       LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
-      [...params, f.pageSize, (f.page - 1) * f.pageSize],
-    );
-    return { rows, total: total.rows[0]?.n ?? 0 };
+  async listAudit(
+    db: Database,
+    f: { page: number; pageSize: number; targetUserId?: string },
+  ): Promise<{ rows: AuditRow[]; total: number }> {
+    const where = f.targetUserId ? eq(auditRecords.targetUserId, f.targetUserId) : undefined;
+
+    const totalRows = await db
+      .select({ n: sql<number>`count(*)::int` })
+      .from(auditRecords)
+      .where(where);
+    const rows = await db
+      .select({
+        id: auditRecords.id,
+        actorId: auditRecords.actorId,
+        targetUserId: auditRecords.targetUserId,
+        action: auditRecords.action,
+        reason: auditRecords.reason,
+        occurredAt: auditRecords.occurredAt,
+        correlationId: auditRecords.correlationId,
+      })
+      .from(auditRecords)
+      .where(where)
+      .orderBy(sql`${auditRecords.occurredAt} DESC`, auditRecords.id)
+      .limit(f.pageSize)
+      .offset((f.page - 1) * f.pageSize);
+    return { rows, total: totalRows[0]?.n ?? 0 };
   },
 
   /** Boot-time bootstrap. Returns false if the address already has an account (never escalated). */
   async insertSeededAdmin(
-    q: Queryable,
+    db: Database,
     u: { id: string; email: string; passwordHash: string; displayName: string },
   ): Promise<boolean> {
-    const { rows } = await q.query(
-      `INSERT INTO users (id, email, password_hash, status, is_seeded_admin, activated_at)
-       VALUES ($1, $2, $3, 'ACTIVE', true, now())
-       ON CONFLICT ((lower(email))) DO NOTHING
-       RETURNING id`,
-      [u.id, u.email, u.passwordHash],
-    );
-    if (rows.length === 0) return false;
-    await q.query(`INSERT INTO user_roles (user_id, role) VALUES ($1, 'STUDENT'), ($1, 'ADMIN')`, [
-      u.id,
+    // An address that already has an account is skipped, never escalated; any
+    // other violation must surface (see insertUser).
+    try {
+      await db.insert(users).values({
+        id: u.id,
+        email: u.email,
+        passwordHash: u.passwordHash,
+        status: 'ACTIVE',
+        isSeededAdmin: true,
+        activatedAt: sql`now()`,
+      });
+    } catch (err) {
+      if (isUniqueViolation(err, EMAIL_UNIQUE_INDEX)) return false;
+      throw err;
+    }
+    await db.insert(userRoles).values([
+      { userId: u.id, role: 'STUDENT' },
+      { userId: u.id, role: 'ADMIN' },
     ]);
-    await q.query(`INSERT INTO profiles (user_id, display_name) VALUES ($1, $2)`, [
-      u.id,
-      u.displayName,
-    ]);
+    await db.insert(profiles).values({ userId: u.id, displayName: u.displayName });
     return true;
   },
 };
 
-export interface AdminUserRow extends Record<string, unknown> {
+export interface AdminUserRow {
   id: string;
   email: string;
   status: AccountStatus;
-  is_seeded_admin: boolean;
-  created_at: Date;
-  activated_at: Date | null;
-  display_name: string;
+  isSeededAdmin: boolean;
+  createdAt: Date;
+  activatedAt: Date | null;
+  displayName: string;
   faculty: string | null;
-  avatar_ref: string | null;
-  contact_preference: string;
-  preferred_mode: string;
+  avatarRef: string | null;
+  contactPreference: string;
+  preferredMode: string;
   roles: Role[];
 }
 
-export interface AuditRow extends Record<string, unknown> {
+export interface AuditRow {
   id: string;
-  actor_id: string;
-  target_user_id: string;
+  actorId: string;
+  targetUserId: string;
   action: AuditAction;
   reason: string;
-  occurred_at: Date;
-  correlation_id: string;
+  occurredAt: Date;
+  correlationId: string;
 }
-
-const ADMIN_USER_SELECT = `
-  SELECT u.id, u.email, u.status, u.is_seeded_admin, u.created_at, u.activated_at,
-         coalesce(p.display_name, '') AS display_name, p.faculty, p.avatar_ref,
-         coalesce(p.contact_preference, 'IN_APP') AS contact_preference,
-         coalesce(p.preferred_mode, 'REQUESTER') AS preferred_mode,
-         ${ROLES} AS roles
-  FROM users u LEFT JOIN profiles p ON p.user_id = u.id`;

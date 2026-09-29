@@ -9,7 +9,10 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "dev": "cross-env SERVICE_NAME=supplier-service PORT=3002 tsx watch src/main.ts",
     "start": "node dist/main.js",
-    "test": "vitest run"
+    "test": "vitest run",
+    "db:generate": "drizzle-kit generate",
+    "db:studio": "drizzle-kit studio",
+    "db:push": "drizzle-kit push"
   },
   "dependencies": {
     "@foc/auth-client": "*",
@@ -17,6 +20,7 @@
     "@nestjs/common": "^12.0.3",
     "@nestjs/core": "^12.0.3",
     "@nestjs/platform-express": "^12.0.3",
+    "drizzle-orm": "^0.45.3",
     "papaparse": "^5.7.0",
     "pg": "^8.23.0",
     "reflect-metadata": "^0.2.2",
@@ -30,6 +34,7 @@
     "@types/pg": "^8.23.1",
     "@types/supertest": "^6.0.2",
     "cross-env": "^10.0.0",
+    "drizzle-kit": "^0.31.11",
     "supertest": "^7.2.2",
     "tsx": "^4.20.0",
     "typescript": "^5.9.0",
